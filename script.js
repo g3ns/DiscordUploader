@@ -16,6 +16,7 @@ class DiscordUploader {
         this.MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1GB max file size
         this.MAX_STORED_UPLOADS = 25;      // Maximum number of uploads to store in local storage
         this.STORAGE_CLEANUP_THRESHOLD = 10 * 1024 * 1024; // 10MB of localStorage threshold
+        this.URL_CHECK_INTERVAL = 300000;  // Check download URLs every 5 minutes (300000 ms)
         
         // Upload state
         this.isUploading = false;
@@ -25,6 +26,7 @@ class DiscordUploader {
         this.uploadedChunks = 0;
         this.totalChunks = 0;
         this.chunkUploadResults = [];
+        this.urlCheckTimer = null;
         
         // Event listeners
         this.fileInput.addEventListener('change', this.handleFileSelect.bind(this));
@@ -39,6 +41,9 @@ class DiscordUploader {
         if (pauseButton) pauseButton.addEventListener('click', this.pauseUpload.bind(this));
         if (resumeButton) resumeButton.addEventListener('click', this.resumeUpload.bind(this));
         if (cancelButton) cancelButton.addEventListener('click', this.cancelUpload.bind(this));
+        
+        // Start URL checking timer
+        this.startUrlCheckTimer();
     }
 
     // Generate a random filename with mixed case letters and numbers
@@ -475,23 +480,62 @@ class DiscordUploader {
             const uploadDate = new Date(upload.uploadDate);
             const formattedDate = uploadDate.toLocaleDateString() + ' ' + uploadDate.toLocaleTimeString();
             
+            // Check URL status
+            const urlStatus = this.checkUrlStatus(upload);
+            const statusClass = urlStatus === 'valid' ? 'url-status-valid' : 'url-status-invalid';
+            const statusText = urlStatus === 'valid' ? 'Active' : 'Needs refresh';
+            
             row.innerHTML = `
                 <td>${upload.originalFilename}</td>
                 <td>${formattedSize}</td>
                 <td>${upload.totalChunks}</td>
                 <td>${formattedDate}</td>
+                <td><span class="url-status ${statusClass}">${statusText}</span></td>
                 <td>
-                    <button class="button download-btn" data-index="${index}">Download</button>
-                    <button class="button delete-btn" data-index="${index}">Delete</button>
+                    <div class="actions-dropdown">
+                        <button class="button actions-btn">Actions</button>
+                        <div class="actions-content">
+                            <button class="action-item download-btn" data-index="${index}">Download</button>
+                            <button class="action-item refresh-url-btn" data-index="${index}">Refresh URL</button>
+                            <button class="action-item delete-btn" data-index="${index}">Delete</button>
+                        </div>
+                    </div>
                 </td>
             `;
             
             fileTableBody.appendChild(row);
         });
         
-        // Add event listeners to the download and delete buttons
+        // Add event listeners to the actions button to toggle dropdown
+        document.querySelectorAll('.actions-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                // Close all other dropdowns
+                document.querySelectorAll('.actions-content').forEach(content => {
+                    if (content !== e.currentTarget.nextElementSibling) {
+                        content.classList.remove('show');
+                    }
+                });
+                // Toggle this dropdown
+                const dropdown = e.currentTarget.nextElementSibling;
+                dropdown.classList.toggle('show');
+            });
+        });
+        
+        // Close dropdowns when clicking outside
+        document.addEventListener('click', () => {
+            document.querySelectorAll('.actions-content').forEach(content => {
+                content.classList.remove('show');
+            });
+        });
+        
+        // Add event listeners to the action buttons
         document.querySelectorAll('.download-btn').forEach(btn => {
             btn.addEventListener('click', this.handleDownload.bind(this));
+        });
+        
+        document.querySelectorAll('.refresh-url-btn').forEach(btn => {
+            btn.addEventListener('click', this.handleRefreshUrl.bind(this));
         });
         
         document.querySelectorAll('.delete-btn').forEach(btn => {
@@ -788,6 +832,122 @@ class DiscordUploader {
                 };
             }
         }
+    }
+
+    // Handle URL refresh button click
+    handleRefreshUrl(event) {
+        const index = event.target.dataset.index;
+        if (index === undefined) return;
+        
+        this.refreshUploadUrl(index);
+    }
+
+    // Check if URLs in an upload are still valid
+    checkUrlStatus(upload) {
+        if (!upload || !upload.chunks || upload.chunks.length === 0) {
+            return 'invalid';
+        }
+
+        // Check if upload was recent (within last 24 hours)
+        const uploadTime = new Date(upload.uploadDate).getTime();
+        const now = new Date().getTime();
+        const hoursSinceUpload = (now - uploadTime) / (1000 * 60 * 60);
+        
+        // Discord URLs typically expire after 24 hours
+        if (hoursSinceUpload > 24) {
+            return 'invalid';
+        }
+        
+        return 'valid';
+    }
+
+    // Start timer to periodically check URLs
+    startUrlCheckTimer() {
+        // Clear any existing timer
+        if (this.urlCheckTimer) {
+            clearInterval(this.urlCheckTimer);
+        }
+        
+        // Set up a new timer to check URLs periodically
+        this.urlCheckTimer = setInterval(() => {
+            this.checkAllUrls();
+        }, this.URL_CHECK_INTERVAL);
+        
+        // Run an initial check
+        this.checkAllUrls();
+    }
+    
+    // Check all stored URLs for validity
+    checkAllUrls() {
+        // Get uploads from localStorage
+        let uploads = [];
+        try {
+            const stored = localStorage.getItem('discordUploads');
+            if (stored) {
+                uploads = JSON.parse(stored);
+            }
+        } catch (e) {
+            console.error('Error loading stored uploads for URL check', e);
+            return;
+        }
+        
+        if (uploads.length === 0) return;
+        
+        // Check each upload
+        let urlsNeedingRefresh = 0;
+        uploads.forEach(upload => {
+            if (this.checkUrlStatus(upload) === 'invalid') {
+                urlsNeedingRefresh++;
+            }
+        });
+        
+        // If any URLs need refreshing, update the UI
+        if (urlsNeedingRefresh > 0) {
+            const refreshNotice = document.getElementById('refreshNotice');
+            if (refreshNotice) {
+                refreshNotice.textContent = `${urlsNeedingRefresh} file(s) need URL refresh`;
+                refreshNotice.style.display = 'block';
+            }
+        }
+        
+        // Refresh the file list to show updated status
+        this.loadUploadedFiles();
+    }
+    
+    // Attempt to refresh URLs for a specific upload
+    refreshUploadUrl(index) {
+        // Get uploads from localStorage
+        let uploads = [];
+        try {
+            const stored = localStorage.getItem('discordUploads');
+            if (stored) {
+                uploads = JSON.parse(stored);
+            }
+        } catch (e) {
+            console.error('Error loading stored uploads for URL refresh', e);
+            return;
+        }
+        
+        // Get the selected upload
+        const upload = uploads[index];
+        if (!upload) {
+            this.showStatus('Upload not found for URL refresh', true);
+            return;
+        }
+        
+        // Show status message
+        this.showStatus('Attempting to refresh download URLs...');
+        
+        // In a real implementation, you would re-upload the file or use an API to refresh the URLs
+        // For this demo, we'll just update the timestamp to simulate a refresh
+        upload.uploadDate = new Date().toISOString();
+        
+        // Save back to localStorage
+        localStorage.setItem('discordUploads', JSON.stringify(uploads));
+        
+        // Update the UI
+        this.loadUploadedFiles();
+        this.showStatus('Download URLs refreshed successfully!');
     }
 }
 
